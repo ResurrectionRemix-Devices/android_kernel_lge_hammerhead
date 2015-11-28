@@ -35,6 +35,8 @@ static struct kobject *module_kobj;
 
 static DEFINE_MUTEX(panel_cmd_mutex);
 
+#define MIN_REFRESH_RATE 30
+
 DEFINE_LED_TRIGGER(bl_led_trigger);
 
 #if defined(CONFIG_BACKLIGHT_LM3630) && defined(CONFIG_MACH_LGE)
@@ -222,10 +224,7 @@ int mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
 {
 	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
 	struct mdss_panel_info *pinfo = NULL;
-	int rc = 0;
-#ifndef CONFIG_MACH_LGE
-	int i;
-#endif
+	int i, rc = 0;
 
 	if (pdata == NULL) {
 		pr_err("%s: Invalid input data\n", __func__);
@@ -256,24 +255,21 @@ int mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
 			return rc;
 		}
 		if (!pinfo->cont_splash_enabled) {
+			if (pinfo->on_pre_rst_delay) {
+				pr_debug("%s: on_pre_rst_delay:%d\n",
+						__func__, pinfo->on_pre_rst_delay);
+				usleep(pinfo->on_pre_rst_delay * 1000);
+			}
+
 			if (gpio_is_valid(ctrl_pdata->disp_en_gpio))
 				gpio_set_value((ctrl_pdata->disp_en_gpio), 1);
-#ifdef CONFIG_MACH_LGE
-			usleep(20 * 1000);
-			gpio_set_value((ctrl_pdata->rst_gpio), 1);
-			usleep(15 * 1000);
-			gpio_set_value((ctrl_pdata->rst_gpio), 0);
-			udelay(20);
-			gpio_set_value((ctrl_pdata->rst_gpio), 1);
-			usleep(10 * 1000);
-#else
+
 			for (i = 0; i < pdata->panel_info.rst_seq_len; ++i) {
 				gpio_set_value((ctrl_pdata->rst_gpio),
 					pdata->panel_info.rst_seq[i]);
 				if (pdata->panel_info.rst_seq[++i])
 					usleep(pinfo->rst_seq[i] * 1000);
 			}
-#endif
 		}
 
 		if (gpio_is_valid(ctrl_pdata->mode_gpio)) {
@@ -293,15 +289,24 @@ int mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
 			gpio_set_value((ctrl_pdata->disp_en_gpio), 0);
 			gpio_free(ctrl_pdata->disp_en_gpio);
 		}
-#ifdef CONFIG_MACH_LGE
-		usleep(20 * 1000);
-#endif
+
+		if (pinfo->off_pre_rst_delay) {
+			pr_debug("%s: off_pre_rst_delay:%d\n",
+					__func__, pinfo->off_pre_rst_delay);
+			usleep(pinfo->off_pre_rst_delay * 1000);
+		}
+
 		gpio_set_value((ctrl_pdata->rst_gpio), 0);
 		gpio_free(ctrl_pdata->rst_gpio);
-#ifndef CONFIG_MACH_LGE
+
+		if (pinfo->off_post_rst_delay) {
+			pr_debug("%s: off_post_rst_delay:%d\n",
+					__func__, pinfo->off_post_rst_delay);
+			usleep(pinfo->off_post_rst_delay * 1000);
+		}
+
 		if (gpio_is_valid(ctrl_pdata->mode_gpio))
 			gpio_free(ctrl_pdata->mode_gpio);
-#endif
 	}
 	return rc;
 }
@@ -924,6 +929,85 @@ static int mdss_dsi_parse_panel_features(struct device_node *np,
 	return 0;
 }
 
+static int mdss_dsi_set_refresh_rate_range(struct device_node *pan_node,
+		struct mdss_panel_info *pinfo)
+{
+	int rc = 0;
+	rc = of_property_read_u32(pan_node,
+			"qcom,mdss-dsi-min-refresh-rate",
+			&pinfo->min_fps);
+	if (rc) {
+		pr_warn("%s:%d, Unable to read min refresh rate\n",
+				__func__, __LINE__);
+
+		/*
+		 * Since min refresh rate is not specified when dynamic
+		 * fps is enabled, using minimum as 30
+		 */
+		pinfo->min_fps = MIN_REFRESH_RATE;
+		rc = 0;
+	}
+
+	rc = of_property_read_u32(pan_node,
+			"qcom,mdss-dsi-max-refresh-rate",
+			&pinfo->max_fps);
+	if (rc) {
+		pr_warn("%s:%d, Unable to read max refresh rate\n",
+				__func__, __LINE__);
+
+		/*
+		 * Since max refresh rate was not specified when dynamic
+		 * fps is enabled, using the default panel refresh rate
+		 * as max refresh rate supported.
+		 */
+		pinfo->max_fps = pinfo->mipi.frame_rate;
+		rc = 0;
+	}
+
+	pr_info("dyn_fps: min = %d, max = %d\n",
+			pinfo->min_fps, pinfo->max_fps);
+	return rc;
+}
+
+static void mdss_dsi_parse_dfps_config(struct device_node *pan_node,
+			struct mdss_dsi_ctrl_pdata *ctrl_pdata)
+{
+	const char *data;
+	bool dynamic_fps;
+	struct mdss_panel_info *pinfo = &(ctrl_pdata->panel_data.panel_info);
+
+	dynamic_fps = of_property_read_bool(pan_node,
+			"qcom,mdss-dsi-pan-enable-dynamic-fps");
+
+	if (!dynamic_fps)
+		return;
+
+	pinfo->dynamic_fps = true;
+	data = of_get_property(pan_node, "qcom,mdss-dsi-pan-fps-update", NULL);
+	if (data) {
+		if (!strcmp(data, "dfps_suspend_resume_mode")) {
+			pinfo->dfps_update = DFPS_SUSPEND_RESUME_MODE;
+			pr_debug("dfps mode: suspend/resume\n");
+		} else if (!strcmp(data, "dfps_immediate_clk_mode")) {
+			pinfo->dfps_update = DFPS_IMMEDIATE_CLK_UPDATE_MODE;
+			pr_debug("dfps mode: Immediate clk\n");
+		} else if (!strcmp(data, "dfps_immediate_porch_mode")) {
+			pinfo->dfps_update = DFPS_IMMEDIATE_PORCH_UPDATE_MODE;
+			pr_debug("dfps mode: Immediate porch\n");
+		} else {
+			pinfo->dfps_update = DFPS_SUSPEND_RESUME_MODE;
+			pr_debug("default dfps mode: suspend/resume\n");
+		}
+		mdss_dsi_set_refresh_rate_range(pan_node, pinfo);
+	} else {
+		pinfo->dynamic_fps = false;
+		pr_debug("dfps update mode not configured: disable\n");
+	}
+	pinfo->new_fps = pinfo->mipi.frame_rate;
+
+	return;
+}
+
 static int mdss_panel_parse_dt(struct device_node *np,
 			struct mdss_dsi_ctrl_pdata *ctrl_pdata)
 {
@@ -1226,11 +1310,22 @@ static int mdss_panel_parse_dt(struct device_node *np,
 			ctrl_pdata->status_mode = ESD_REG;
 	}
 
+	rc = of_property_read_u32(np, "qcom,mdss-dsi-on-pre-reset-delay", &tmp);
+	pinfo->on_pre_rst_delay = (!rc ? tmp : 0);
+
+	rc = of_property_read_u32(np, "qcom,mdss-dsi-off-pre-reset-delay", &tmp);
+	pinfo->off_pre_rst_delay = (!rc ? tmp : 0);
+
+	rc = of_property_read_u32(np, "qcom,mdss-dsi-off-post-reset-delay", &tmp);
+	pinfo->off_post_rst_delay = (!rc ? tmp : 0);
+
 	rc = mdss_dsi_parse_panel_features(np, ctrl_pdata);
 	if (rc) {
 		pr_err("%s: failed to parse panel features\n", __func__);
 		goto error;
 	}
+
+	mdss_dsi_parse_dfps_config(np, ctrl_pdata);
 
 	return 0;
 
